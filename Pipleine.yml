@@ -1,0 +1,131 @@
+stages: [render, deploy]
+
+variables:
+  VALUES_ROOT: "platform-gitops/values"
+  MANIFESTS_OUT_DIR: "manifests"
+  DEFAULT_CHART_MS: "charts/quarkus-ms-base"
+  DEFAULT_CHART_BACKSTAGE: "charts/backstage"
+  CI_SKIP_PUSH_OPTION: "-o ci.skip"
+
+render_manifests:
+  stage: render
+  resource_group: gitops-manifests
+  image: layer-kraft.registry.saas.cagip.group.gca/ci-tools/helm:3
+  before_script:
+    - set -euo pipefail
+    - git config user.email "ci-bot@local"
+    - git config user.name "ci-bot"
+    # push token si tu commites dans le même repo
+    - git remote set-url origin "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch --all --tags --prune
+  script:
+    - |
+      set -euo pipefail
+
+      echo "CI_COMMIT_SHA=$CI_COMMIT_SHA"
+      echo "CI_COMMIT_BEFORE_SHA=$CI_COMMIT_BEFORE_SHA"
+
+      # 1) Détecter les values modifiés
+      if [ "${CI_COMMIT_BEFORE_SHA:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${CI_COMMIT_BEFORE_SHA:-}" ]; then
+        echo "No before SHA => fallback: scan all values"
+        CHANGED_VALUES="$(find "${VALUES_ROOT}" -type f -name "*.y*ml" | sort || true)"
+      else
+        CHANGED_VALUES="$(git diff --name-only "${CI_COMMIT_BEFORE_SHA}" "${CI_COMMIT_SHA}" \
+          | grep -E "^${VALUES_ROOT}/(development|staging|production)/.+\.(ya?ml)$" || true)"
+      fi
+
+      if [ -z "${CHANGED_VALUES}" ]; then
+        echo "No values changes detected => nothing to render"
+        exit 0
+      fi
+
+      echo "Changed values:"
+      echo "${CHANGED_VALUES}"
+
+      rm -f deploy.env apps-to-sync.txt || true
+      touch apps-to-sync.txt
+
+      # 2) Render uniquement les apps touchées
+      for f in ${CHANGED_VALUES}; do
+        # f = platform-gitops/values/<env>/<kind>/<app>.yaml
+        ENV="$(echo "$f" | awk -F/ '{print $(NF-2)}')"       # development|staging|production
+        KIND="$(echo "$f" | awk -F/ '{print $(NF-1)}')"      # ms|backstage
+        APP_FILE="$(basename "$f")"
+        APP="${APP_FILE%.*}"
+
+        # Chart par défaut selon KIND
+        if [ "$KIND" = "backstage" ]; then
+          DEFAULT_CHART="${DEFAULT_CHART_BACKSTAGE}"
+        else
+          DEFAULT_CHART="${DEFAULT_CHART_MS}"
+        fi
+
+        # Override chart / releaseName / namespace / argocdApp via x-deploy.*
+        CHART_PATH="$(yq -r '.x-deploy.chart // ""' "$f" 2>/dev/null || true)"
+        [ -z "${CHART_PATH}" ] && CHART_PATH="${DEFAULT_CHART}"
+
+        RELEASE_NAME="$(yq -r ".x-deploy.releaseName // \"${APP}\"" "$f" 2>/dev/null || echo "${APP}")"
+        NAMESPACE="$(yq -r '.x-deploy.namespace // "default"' "$f" 2>/dev/null || echo "default")"
+        ARGO_APP="$(yq -r ".x-deploy.argocdApp // \"${APP}-${ENV}\"" "$f" 2>/dev/null || echo "${APP}-${ENV}")"
+
+        echo "----"
+        echo "ENV=${ENV} KIND=${KIND} APP=${APP}"
+        echo "VALUES=${f}"
+        echo "CHART=${CHART_PATH}"
+        echo "RELEASE=${RELEASE_NAME} NS=${NAMESPACE} ARGO_APP=${ARGO_APP}"
+
+        OUT="${MANIFESTS_OUT_DIR}/${ENV}/${KIND}/${APP}.yaml"
+        mkdir -p "$(dirname "${OUT}")"
+
+        # deps chart si besoin
+        if [ -f "${CHART_PATH}/Chart.yaml" ]; then
+          helm dependency build "${CHART_PATH}" || true
+        fi
+
+        helm template "${RELEASE_NAME}" "${CHART_PATH}" \
+          -n "${NAMESPACE}" \
+          -f "${f}" \
+          > "${OUT}"
+
+        echo "${ARGO_APP}" >> apps-to-sync.txt
+      done
+
+      # 3) Commit uniquement si manifests changent
+      git add "${MANIFESTS_OUT_DIR}/" || true
+      if git diff --cached --quiet; then
+        echo "No diff => no commit"
+      else
+        git commit -m "chore(gitops): render manifests (${CI_COMMIT_SHORT_SHA})"
+        git push origin "${CI_COMMIT_BRANCH}" ${CI_SKIP_PUSH_OPTION}
+      fi
+
+      # 4) Exporter la liste d'apps à sync
+      APPS_CSV="$(sort -u apps-to-sync.txt | paste -sd, -)"
+      echo "DEPLOY_APPS=${APPS_CSV}" > deploy.env
+      echo "Apps to sync: ${APPS_CSV}"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 day
+
+deploy_argocd:
+  stage: deploy
+  image: layer-kraft.registry.saas.cagip.group.gca/ci-tools/argocd:latest
+  needs: ["render_manifests"]
+  rules:
+    - when: on_success
+  script:
+    - set -euo pipefail
+    - |
+      if [ -z "${DEPLOY_APPS:-}" ]; then
+        echo "No apps to deploy"
+        exit 0
+      fi
+
+      echo "Sync apps: ${DEPLOY_APPS}"
+      echo "${DEPLOY_APPS}" | tr ',' '\n' | while read -r app; do
+        [ -z "$app" ] && continue
+        echo "---- Sync ${app}"
+        argocd app sync "${app}" --server "${ARGOCD_HOST}" --auth-token "${ARGOCD_TOKEN}" --prune --timeout 300
+        argocd app wait "${app}" --server "${ARGOCD_HOST}" --auth-token "${ARGOCD_TOKEN}" --health --operation --timeout 300
+      done
