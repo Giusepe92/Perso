@@ -1,0 +1,145 @@
+# Development values for Backstage (portail-rosetta)
+# Path example: platform-gitops/values/development/backstage/portail-rosetta.yaml
+
+x-deploy:
+  namespace: "backstage-dev"
+  releaseName: "portail-rosetta"
+  argocdApp: "portail-rosetta-development"
+  # chart: "charts/backstage"  # optional (defaults to backstage chart in CI)
+
+image:
+  repository: "registry.saas.cagip.group.gca/backstage/portail-rosetta"
+  tag: "0.9.0"
+  pullPolicy: IfNotPresent
+  pullSecrets: [] # e.g. ["regcred"]
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: "" # if empty, chart will name it
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 7007
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: "portail-rosetta.dev.example.local"
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: [] # e.g. [{ secretName: portail-rosetta-dev-tls, hosts: [portail-rosetta.dev.example.local] }]
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 75
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Environment variables for the Backstage container
+extraEnv:
+  - name: NODE_ENV
+    value: development
+  - name: APP_ENV
+    value: development
+  - name: LOG_LEVEL
+    value: info
+
+# If your chart supports mounting app-config.yaml (recommended),
+# you can keep Backstage config in a single YAML block.
+backstage:
+  appConfig:
+    app:
+      title: "Portail Rosetta (DEV)"
+      baseUrl: "https://portail-rosetta.dev.example.local"
+
+    organization:
+      name: "CAGIP"
+
+    backend:
+      baseUrl: "https://portail-rosetta.dev.example.local"
+      listen:
+        port: 7007
+      database:
+        client: pg
+        connection:
+          host: "postgres.backstage-dev.svc.cluster.local"
+          port: 5432
+          user: "backstage"
+          password: "${POSTGRES_PASSWORD}"
+          database: "backstage"
+      cache:
+        store: memory
+
+    auth:
+      environment: development
+
+    integrations:
+      gitlab:
+        - host: "gitlab.example.local"
+          token: "${GITLAB_TOKEN}"
+
+    catalog:
+      locations:
+        - type: url
+          target: "https://gitlab.example.local/my-group/catalog-info.yaml"
+
+    proxy:
+      "/grafana/api":
+        target: "https://grafana.dev.example.local"
+        changeOrigin: true
+        secure: true
+
+secrets:
+  existingSecretName: "backstage-dev-secrets"
+  envFromSecret:
+    - name: POSTGRES_PASSWORD
+      key: POSTGRES_PASSWORD
+    - name: GITLAB_TOKEN
+      key: GITLAB_TOKEN
+
+probes:
+  readiness:
+    enabled: true
+    path: /healthcheck
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
+  liveness:
+    enabled: true
+    path: /healthcheck
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 2
+    failureThreshold: 6
