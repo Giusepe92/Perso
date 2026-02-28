@@ -1,0 +1,124 @@
+flowchart LR
+  %% =========================
+  %% Rosetta V2 - C4 Container
+  %% =========================
+
+  %% People
+  user((Utilisateur Rosetta\n(Dev / FinOps / SRE / Admin)))
+
+  %% External Systems
+  extDyn[Dynatrace\n(Observability)]
+  extSN[ServiceNow / CMDB\n(ITSM + CI)]
+  extArgo[Argo CD\n(Deployments)]
+  extGit[GitLab\n(Code + CI/CD)]
+  extElisa[ELISA / Kibana\n(Logs)]
+
+  %% Backstage System
+  subgraph BS[Backstage (Portail IDP)]
+    bsFE[Backstage Frontend\n(React UI)]
+    bsBE[Backstage Backend\n(Node)]
+    
+    %% Frontend Plugins
+    subgraph PLUG[Plugins Frontend Rosetta]
+      pCore[rosetta-core\n(UI components partagés)]
+      pFin[rosetta-finops\n(UI coûts + admin)]
+      pMon[rosetta-monitoring\n(UI SLO/DORA + incidents)]
+      pRef[rosetta-referentiel\n(UI cartographie + approvals)]
+    end
+
+    %% Backend Gateway plugin
+    gw[rosetta-gateway-backend\n(Proxy + auth forwarding)]
+    
+    %% Backstage modules
+    modAuthZ[Module AuthZ / RBAC\n(AD groups mapping, policy)]
+    modCatalog[Module Catalog Integration\n(Providers + Processors)]
+  end
+
+  %% Rosetta Microservices
+  subgraph ROS[Rosetta Microservices (Quarkus REST)]
+    refApi[platform-ref-api\n(Référentiel + Approvals)]
+    finApi[finops-api\n(Serving FinOps + Pricing Views)]
+    monApi[monitoring-api\n(Serving Monitoring + Live connectors)]
+  end
+
+  %% Batch Jobs
+  subgraph BATCH[Batch Jobs (CronJob Kubernetes)]
+    finBatch[finops-batch\n(Normalisation + calcul + refresh MVs)]
+    monBatch[monitoring-batch\n(Ingestion + KPI + refresh MVs)]
+  end
+
+  %% Data Stores
+  subgraph DATA[Data Stores]
+    mongo[(MongoDB\nRaw Zone / Landing)]
+    pgRef[(PostgreSQL\nplatform_ref_db (OLTP))]
+    pgFin[(PostgreSQL\nfinops_db (Data Mart + MVs))]
+    pgMon[(PostgreSQL\nmonitoring_db (Data Mart + MVs))]
+    pgBS[(PostgreSQL\nBackstage DB (gérée par Backstage))]
+  end
+
+  %% =========================
+  %% Relationships
+  %% =========================
+
+  %% User to Backstage
+  user -->|Navigue / consulte / admin| bsFE
+
+  %% Frontend plugins inside Backstage FE
+  bsFE --> pCore
+  bsFE --> pFin
+  bsFE --> pMon
+  bsFE --> pRef
+
+  %% FE calls to Backstage backend / gateway
+  pFin -->|HTTP /api/rosetta/finops/*| gw
+  pMon -->|HTTP /api/rosetta/monitoring/*| gw
+  pRef -->|HTTP /api/rosetta/ref/*| gw
+
+  %% Backstage backend uses modules
+  bsBE --> gw
+  bsBE --> modAuthZ
+  bsBE --> modCatalog
+  bsBE -->|Lit/écrit| pgBS
+
+  %% Gateway to microservices
+  gw -->|Proxy + token forwarding| finApi
+  gw -->|Proxy + token forwarding| monApi
+  gw -->|Proxy + token forwarding| refApi
+
+  %% Microservices to their databases
+  refApi -->|OLTP read/write| pgRef
+  finApi -->|read (facts/MVs)| pgFin
+  monApi -->|read (facts/MVs)| pgMon
+
+  %% Batch reads raw + writes marts
+  finBatch -->|read raw exports| mongo
+  finBatch -->|write facts + refresh MVs| pgFin
+
+  monBatch -->|read raw exports| mongo
+  monBatch -->|write facts/KPIs + refresh MVs| pgMon
+
+  %% Catalog module integrations (discovery/enrichment)
+  modCatalog -->|Découvre repos / catalog-info.yaml| extGit
+  modCatalog -->|Events: component discovered/updated| refApi
+
+  %% Live connectors (monitoring-api)
+  monApi -->|Live metrics / problems| extDyn
+  monApi -->|Incidents / changes / CI mapping| extSN
+  monApi -->|Live deployment health| extArgo
+  monApi -->|Live pipelines| extGit
+  monApi -->|Logs link/context| extElisa
+
+  %% Raw zone population (externe)
+  extSN -->|Dumps/exports| mongo
+  extDyn -->|Exports| mongo
+
+  %% Styling (optional)
+  classDef store fill:#f6f6f6,stroke:#333,stroke-width:1px;
+  classDef svc fill:#e8f5ff,stroke:#1b4f72,stroke-width:1px;
+  classDef batch fill:#fff3e0,stroke:#8a4b08,stroke-width:1px;
+  classDef ext fill:#f0f0ff,stroke:#444,stroke-width:1px;
+
+  class mongo,pgRef,pgFin,pgMon,pgBS store;
+  class refApi,finApi,monApi svc;
+  class finBatch,monBatch batch;
+  class extDyn,extSN,extArgo,extGit,extElisa ext;
