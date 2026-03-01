@@ -279,9 +279,9 @@ Elle favorise la collaboration entre :
 
 ## Multi-entités & Vision Groupe
 
-- Consolidation inter-entités
+- Consolidation inter-entités vers base groupe
 - Benchmark interne
-- Vision transverse CAGIP
+- Vision transverse groupe
 
 ## Score de maturité global
 
