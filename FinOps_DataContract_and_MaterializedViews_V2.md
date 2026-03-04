@@ -13,13 +13,13 @@
 
 ### 1.1 Grain “source of truth”
 - Le **grain pivot** reste la **consommation mensuelle** par application et par produit :
-  - `month` + `application_id` + `product_id` (+ `environment` optionnel)
+  - `month` + `application_id` + `product_id` (+ `environment` optionnel, + `resource` optionnel)
   - `quantity` = UO consommées (direct) **ou** poids/coefficient (indirect)
 - Le **coût** se calcule par :
   - **Réel (par mois)** : `quantity * unit_price(pricing_view du mois)`
   - **Simulation (what-if)** : `quantity * unit_price(pricing_view choisie)`
 
-### 1.2 Hot Month / Cold History
+### 1.2 Hot Month / Cold History (évolution future)
 - **Mois courant** (“Hot Month”) : calcul à la volée (les quantités bougent au fil de l’eau).
 - **Mois passés** (“Cold History”) : pré-calcul nightly en MV (stable + très rapide).
 
@@ -68,17 +68,8 @@
 - `product_description` (nullable)
 - `domain_id` (FK -> dim_domain) — **obligatoire**
 - `family_id` (FK -> dim_family) — **nullable**
-- `uo_label` (ex: "Go", "vCPU-hour", "licence", "GB-day", "weight")
-- `metadata_schema_key` (nullable) — clé UI (ex: `server_line`, `k8s_deployment`)
-- `is_active` (bool)
-- `decommissioned_at` (nullable)
 - `created_at`, `updated_at`
 
-##### Produits indirects 
-| product_code   |  product_name     |   product_description    
-|---    |:-:    | :-:
-|  abstract_network     |  Domaine Réseaux     |  Le coût est calculé par rapport au poid de l'application dans le domaine OPEN    
-|   abstract_transversal    |   Domaine Transverse    |  Le coût est calculé par rapport au poid de l'application dans le domaine OPEN
 
 > Règle : **ne jamais supprimer** un produit utilisé dans des facts, on le **désactive**.
 
@@ -93,8 +84,8 @@
 #### `pricing_view_line` (les prix unitaires des produits par vision budgétaire)
 - `pricing_view_id` (FK -> pricing_view)
 - `product_id` (FK -> dim_product)
-- `unit_price` (numeric) (exemple 1.2)
-- `currency` (ex: EUR)
+- `unit_price` (numeric) (exemple 1.2) ( 0 si pas de prix )
+- `currency` (ex: EUR) 
 - `created_at`
 - **PK** (`pricing_view_id`, `product_id`)
 
@@ -109,7 +100,7 @@
 
 ### 2.3 Facts
 
-#### `fact_consumption_monthly` ✅
+#### `fact_consumption_monthly` ✅  (Fact de consommation : grain= domain x application x produit x mois x environnement)
 Grain : **(month, application_id, product_id, environment?)**
 
 - `fact_id` (PK)
@@ -120,46 +111,31 @@ Grain : **(month, application_id, product_id, environment?)**
 - `family_id` (FK, nullable) — **dénormalisé**
 - `environment` (nullable)
 - `quantity` (numeric)
-- `quantity_unit` (nullable)
-- `ingestion_source`
-- `metadata` (jsonb, nullable)
+- `resource`  (nullable)  (exemple : sv0125484 = le nom du serveur)
+- `metadata` (jsonb, nullable) ( avec: info - phrase explicative `coef dispo utilisé=5, consommation open utilisée = 1500/25000` // ingestion_source= `gozen/API Gitlab/ ... etc` )
 - `created_at`, `updated_at`
 
 > Le fait d’avoir `domain_id`/`family_id` dans la fact simplifie le drill-down (pas d’erreur de `WHERE domain_id = ...`).
 
-#### `fact_consumption_detail` (optionnel)
-- `detail_id` (PK)
-- `fact_id` (FK)
-- `item_type`
-- `item_key`
-- `item_label`
-- `quantity`
-- `metadata` (jsonb)
-
-#### `fact_coefficient_monthly` (optionnel)
-- `month`, `application_id`, `domain_id`, `coefficient_key` (PK composite)
-- `coefficient_value`
-- `metadata` (jsonb)
 
 ### 2.4 Batch Runs / Admin / Audit
 
-#### `etl_run`
+#### `etl_run` (les exécution d'un batch) 
 - `run_id` (PK)
-- `job_name`
-- `trigger_type` (`SCHEDULED` | `MANUAL` | `API`)
-- `triggered_by`
-- `status`
-- `period_from_month`, `period_to_month`
+- `job_name` (NIGHTLY_FINOPS_RECALCULATE ou TRIGGERED_FINOPS_RECALCULATE)
+- `trigger_type` (`SCHEDULED` | `MANUAL` )
+- `triggered_by` (batch, ou user-id)
+- `status` (FAILED, SUCCESS, TIMEOUT)
+- `period` (month of calculation : exemple : 2026-01)
 - `started_at`, `ended_at`, `duration_ms`
 - `summary` (jsonb)
-- `log_ref` (nullable)
 
-#### `etl_run_step`
+#### `etl_run_step` (les exécutions des étapes d'un batch) 
 - `run_id` (FK)
-- `step_key`
-- `status`
+- `step_key` (DIMENSIONS_UPSERT, OPEN_DOMAIN_ETL_STEP, INDIRECT_OPEN_BASED_WEIGHT, REFRESH_MVS, ...)
+- `status` (FAILED, SUCCESS, TIMEOUT)
 - `started_at`, `ended_at`, `duration_ms`
-- `metrics` (jsonb)
+- `metrics` (jsonb)  
 - **PK** (`run_id`, `step_key`)
 
 ---
