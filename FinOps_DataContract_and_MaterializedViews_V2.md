@@ -44,66 +44,64 @@
 
 #### `dim_domain`
 - `domain_id` (PK)
-- `domain_key` (unique, stable)
+- `domain_code` (unique, stable)
 - `domain_name`
 - `domain_description` (nullable)
-- `domain_type` (`DIRECT` | `INDIRECT`)
 - `is_active` (bool)
-- `sort_order` (int, nullable)
-- `owner_group` (nullable)
+- `ìs_indirect` (bool)
 - `created_at`, `updated_at`
 
 #### `dim_family`
 - `family_id` (PK)
 - `domain_id` (FK -> dim_domain)
-- `family_key` (unique dans un domaine)
+- `family_code` (unique dans un domaine)
 - `family_name`
 - `family_description` (nullable)
-- `is_active` (bool)
-- `sort_order` (int, nullable)
 - `created_at`, `updated_at`
 
-> Note : un domaine indirect peut avoir **0 famille**.
+> Note : un domaine peut avoir **0 famille**.
 
 #### `dim_product`
 - `product_id` (PK)
-- `product_key` (unique stable)
+- `product_code` (unique stable)
 - `product_name`
 - `product_description` (nullable)
 - `domain_id` (FK -> dim_domain) — **obligatoire**
-- `family_id` (FK -> dim_family) — **nullable** (cas indirect)
+- `family_id` (FK -> dim_family) — **nullable**
 - `uo_label` (ex: "Go", "vCPU-hour", "licence", "GB-day", "weight")
 - `metadata_schema_key` (nullable) — clé UI (ex: `server_line`, `k8s_deployment`)
 - `is_active` (bool)
 - `decommissioned_at` (nullable)
 - `created_at`, `updated_at`
 
+##### Produits indirects 
+| product_code   |  product_name     |   product_description    
+|---    |:-:    | :-:
+|  abstract_network     |       |  product_name     
+|   abstract_transversal    |       |  product_name     
+
 > Règle : **ne jamais supprimer** un produit utilisé dans des facts, on le **désactive**.
 
 ### 2.2 Pricing Views (visions budgétaires)
 
-#### `pricing_view`
-- `pricing_view_id` (PK)
-- `pricing_view_key` (unique)
-- `name`
-- `description` (nullable)
-- `status` (`DRAFT` | `ACTIVE` | `ARCHIVED`)
-- `valid_from_month` (YYYY-MM-01)
-- `valid_to_month` (YYYY-MM-01, nullable)
-- `created_by`, `created_at`
+#### `pricing_view` (les visions budgétaires)
+- `pricing_view_id` (PK) UUID
+- `pricing_view_code` (unique) (exemple : PV_Q1_2026)
+- `name` (exemple : Budget 2026 / Q1)
+- `created_by`, `updated_at`
 
-#### `pricing_view_line`
+#### `pricing_view_line` (les prix unitaires des produits par vision budgétaire)
 - `pricing_view_id` (FK -> pricing_view)
 - `product_id` (FK -> dim_product)
-- `unit_price` (numeric)
+- `unit_price` (numeric) (exemple 1.2)
 - `currency` (ex: EUR)
 - `created_at`
 - **PK** (`pricing_view_id`, `product_id`)
 
-#### `pricing_calendar`
+#### `pricing_calendar` (les mois disponibles)
 - `month` (YYYY-MM-01) (PK)
 - `pricing_view_id` (FK -> pricing_view)
-- `is_frozen` (bool)
+- `is_frozen` (bool)  (par défaut false en attendant l'implémentation du freeze)
 - `frozen_at` (nullable)
 - `frozen_by` (nullable)
 
@@ -123,7 +121,6 @@ Grain : **(month, application_id, product_id, environment?)**
 - `environment` (nullable)
 - `quantity` (numeric)
 - `quantity_unit` (nullable)
-- `is_indirect` (bool)
 - `ingestion_source`
 - `metadata` (jsonb, nullable)
 - `created_at`, `updated_at`
