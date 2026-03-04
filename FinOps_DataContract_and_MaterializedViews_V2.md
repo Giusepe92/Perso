@@ -77,8 +77,8 @@
 ##### Produits indirects 
 | product_code   |  product_name     |   product_description    
 |---    |:-:    | :-:
-|  abstract_network     |       |  product_name     
-|   abstract_transversal    |       |  product_name     
+|  abstract_network     |  Domaine Réseaux     |  Le coût est calculé par rapport au poid de l'application dans le domaine OPEN    
+|   abstract_transversal    |   Domaine Transverse    |  Le coût est calculé par rapport au poid de l'application dans le domaine OPEN
 
 > Règle : **ne jamais supprimer** un produit utilisé dans des facts, on le **désactive**.
 
