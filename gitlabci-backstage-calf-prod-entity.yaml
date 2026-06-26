@@ -1,0 +1,561 @@
+stages:
+  - build
+  - image
+  - promote_check
+  - promote
+  - gitops_update
+  - version_and_tag
+  - backmerge
+
+workflow:
+  name: '$PROJECT_PIPELINE_NAME'
+  rules:
+    # =========================
+    # PROD — tag immuable
+    # =========================
+    - if: $CI_COMMIT_TAG
+      variables:
+        PIPELINE_KIND: "tag"
+        TARGET_ENV: "production"
+        GITOPS_ENABLED: "true"
+        # Production multi-entités :
+        # - le build Backstage est commun ;
+        # - l'image est ensuite poussée/promue par entité ;
+        # - le GitOps PROD met à jour les values par entité.
+        # Pour l'instant une seule entité est activée : calf.
+        REPO: "no_image_build"
+        PROMOTE_ENABLED: "true"
+        PROD_ENTITIES: "calf"
+        PROJECT_PIPELINE_NAME: 'Nouveau tag - Promotion image Backstage de PRODUCTION multi-entités'
+
+    # =========================
+    # MAIN / MASTER — merges
+    # =========================
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|master)$/'
+      variables:
+        PIPELINE_KIND: "main"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'Main: Création de nouveau tag pour déploiement en production'
+
+    # =========================
+    # RELEASE / HOTFIX
+    # =========================
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/.*$/'
+      variables:
+        PIPELINE_KIND: "release"
+        TARGET_ENV: "staging"
+        REPO: ${STAGING_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Release: Build de STAGING'
+
+    - if: '$CI_COMMIT_BRANCH =~ /^hotfix\/.*$/'
+      variables:
+        PIPELINE_KIND: "hotfix"
+        TARGET_ENV: "staging"
+        REPO: ${STAGING_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Hotfix: Build de STAGING'
+
+    # =========================
+    # DEVELOP
+    # =========================
+    - if: '$SCHEDULE_KIND != "nightly" && $CI_COMMIT_BRANCH == "develop"'
+      variables:
+        PIPELINE_KIND: "develop"
+        TARGET_ENV: "development"
+        REPO: ${SCRATCH_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Develop : Déploiement en DEV'
+
+    # =========================
+    # FEATURE / MR
+    # =========================
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        PIPELINE_KIND: "mr"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'MERGE REQUEST : Validation CI'
+
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*$/'
+      variables:
+        # Blocs à inverser pour activer/désactiver déploiement de la branche en environnement de dev
+        # todo : add a dynamic check on commit message if [deploy-dev] then deploy auto
+        ### Deployment
+        #PIPELINE_KIND: "develop"
+        #TARGET_ENV: "development"
+        #REPO: ${SCRATCH_REPO}
+        #GITOPS_ENABLED: "true"
+        #PROJECT_PIPELINE_NAME: "Feature branch : Deployment CI"
+        ### original
+        PIPELINE_KIND: "feature"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'Feature branch : Validation CI'
+
+    # =========================
+    # NIGHTLY
+    # =========================
+    - if: '$SCHEDULE_KIND == "nightly" && $CI_COMMIT_BRANCH == "develop"'
+      variables:
+        PIPELINE_KIND: "nightly"
+        TARGET_ENV: "development"
+        REPO: ${SCRATCH_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Nightly Develop : Déploiement quotidien en DEV'
+
+    # =========================
+    # FALLBACK
+    # =========================
+    - when: always
+      variables:
+        PIPELINE_KIND: "other"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+
+variables:
+  VERSION_MAJOR_FILE: "version.major"
+  REPO: "no_image_build"
+  PROMOTE_ENABLED: "false"
+  PROMOTED_REPO: ""
+  ENABLE_FEATURE_IMAGE_BUILD: "false"
+
+  # =========================
+  # Production multi-entités
+  # =========================
+  # Variables GitLab à renseigner pour l'entité CALF :
+  # - CALF_STAGING_REPO : repository source où l'image Backstage taggée est poussée avant promotion
+  # - CALF_STABLE_REPO  : repository cible stable après promotion
+  # - CALF_KUBI_URL     : URL/contexte Kubi de l'entité CALF, si nécessaire par l'outil kubi
+  # - CALF_KUBI_TOKEN   : token Kubi déjà fourni, optionnel si le job peut le générer
+  # - CALF_KUBI_TOKEN_ARGS : arguments à passer à `kubi token`, optionnel selon votre contexte
+  #
+  # Pour ajouter une nouvelle entité, dupliquer les jobs :
+  # - image_push_calf
+  # - promote_check_calf
+  # - image_promote_calf
+  # puis ajouter l'entité dans gitops_update_prod_all_entities.
+
+.ci_preamble:
+  before_script:
+    - |
+      if [ "${PIPELINE_KIND}" == "nightly" ]; then
+        IMAGE_TAG="d-${CI_COMMIT_SHORT_SHA}-nightly"
+      elif [ -n "${CI_COMMIT_TAG:-}" ]; then
+        IMAGE_TAG="${CI_COMMIT_TAG}"
+      else
+        if [ "${TARGET_ENV}" == "development" ]; then
+          IMAGE_TAG="d-${CI_COMMIT_SHORT_SHA}"
+        elif [ "${TARGET_ENV}" == "staging" ]; then
+          IMAGE_TAG="rc-${CI_COMMIT_SHORT_SHA}"
+        else
+          IMAGE_TAG="NO_IMAGE_BUILT"
+        fi
+      fi
+      export IMAGE_TAG
+    - export VERSION_MAJOR_FILE="${VERSION_MAJOR_FILE:-version.major}"
+    - test -f "${VERSION_MAJOR_FILE}" || (echo "Missing ${VERSION_MAJOR_FILE}. Create it with MAJOR integer" && exit 1)
+    - export VERSION_MAJOR="$(tr -d ' \n\r\t' < "${VERSION_MAJOR_FILE}")"
+    - export IMAGE_REPOSITORY="${REPO}.${REGISTRY}"
+    - export IMAGE_FULL="$IMAGE_REPOSITORY/${CI_PROJECT_NAME}:${IMAGE_TAG}"
+    - |
+      if [ -n "${PROMOTED_REPO:-}" ]; then
+        PROMOTED_IMAGE_REPOSITORY="${PROMOTED_REPO}.${REGISTRY}"
+        PROMOTED_IMAGE_FULL="$PROMOTED_IMAGE_REPOSITORY/${CI_PROJECT_NAME}:${IMAGE_TAG}"
+      else
+        PROMOTED_IMAGE_REPOSITORY=""
+        PROMOTED_IMAGE_FULL=""
+      fi
+      export PROMOTED_IMAGE_REPOSITORY PROMOTED_IMAGE_FULL
+    - |
+      echo "VERSION_MAJOR=${VERSION_MAJOR}"
+      echo "PIPELINE_KIND=${PIPELINE_KIND}"
+      echo "SCHEDULE_KIND=${SCHEDULE_KIND}"
+      echo "TARGET_ENV=${TARGET_ENV}"
+      echo "REPO=${REPO}"
+      echo "GITOPS_ENABLED=${GITOPS_ENABLED}"
+      echo "IMAGE_TAG=${IMAGE_TAG}"
+      echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}"
+      echo "IMAGE_FULL=${IMAGE_FULL}"
+      echo "PROMOTE_ENABLED=${PROMOTE_ENABLED:-false}"
+      echo "PROMOTED_REPO=${PROMOTED_REPO:-}"
+      echo "PROMOTED_IMAGE_REPOSITORY=${PROMOTED_IMAGE_REPOSITORY:-}"
+      echo "PROMOTED_IMAGE_FULL=${PROMOTED_IMAGE_FULL:-}"
+
+build:
+  extends: .ci_preamble
+  stage: build
+  image: cagip-sfs-docker-stable-intranet.registry.saas.cagip.group.gca/ci-tools/sfs-node-yarn:22
+  script:
+    - yarn install --immutable
+    - yarn tsc || true
+    - yarn build:backend
+  artifacts:
+    paths:
+      - packages/backend/dist/
+      - packages/app/dist/
+  rules:
+    - if: '$PIPELINE_KIND == "mr"'
+    - if: '$PIPELINE_KIND == "feature"'
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "tag"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+image_push:
+  stage: image
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools:latest
+  needs: ["build"]
+  variables:
+    DOCKERFILE: "packages/backend/Dockerfile"
+  script:
+    - DOCKER_BUILDKIT=1 docker image build --tag ${IMAGE_FULL} --file ${DOCKERFILE} ${CI_PROJECT_DIR}
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login --username ${CI_REGISTRY_USER} --password-stdin ${IMAGE_REPOSITORY}
+    - docker push ${IMAGE_FULL}
+  rules:
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+# =========================
+# PROD ENTITÉ CALF — image Backstage
+# =========================
+# Pour ajouter une nouvelle entité, dupliquer ce job en remplaçant :
+# - calf par le code de l'entité ;
+# - CALF_STAGING_REPO par <ENTITY>_STAGING_REPO ;
+# - needs des jobs suivants si nécessaire.
+image_push_calf:
+  stage: image
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools:latest
+  needs: ["build"]
+  variables:
+    REPO: ${CALF_STAGING_REPO}
+    DOCKERFILE: "packages/backend/Dockerfile"
+  script:
+    - set -euo pipefail
+    - test -n "${CALF_STAGING_REPO:-}" || (echo "ERROR: CALF_STAGING_REPO is required for CALF production image push." && exit 1)
+    - DOCKER_BUILDKIT=1 docker image build --tag ${IMAGE_FULL} --file ${DOCKERFILE} ${CI_PROJECT_DIR}
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login --username ${CI_REGISTRY_USER} --password-stdin ${IMAGE_REPOSITORY}
+    - docker push ${IMAGE_FULL}
+  rules:
+    - if: '$PIPELINE_KIND == "tag"'
+
+# =========================
+# PROD ENTITÉ CALF — promotion
+# =========================
+# Pour ajouter une nouvelle entité, dupliquer promote_check_calf et image_promote_calf
+# avec ses variables propres : <ENTITY>_STAGING_REPO, <ENTITY>_STABLE_REPO,
+# <ENTITY>_KUBI_URL, <ENTITY>_KUBI_TOKEN, <ENTITY>_KUBI_TOKEN_ARGS.
+promote_check_calf:
+  stage: promote_check
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools/promote:latest
+  needs: ["image_push_calf"]
+  variables:
+    REPO: ${CALF_STAGING_REPO}
+    PROMOTED_REPO: ${CALF_STABLE_REPO}
+  rules:
+    - if: '$PIPELINE_KIND == "tag" && $PROMOTE_ENABLED == "true"'
+  before_script:
+    - !reference [.ci_preamble, before_script]
+    - |
+      set -euo pipefail
+      test -n "${CALF_STAGING_REPO:-}" || (echo "ERROR: CALF_STAGING_REPO is required for CALF promotion check." && exit 1)
+      test -n "${CALF_STABLE_REPO:-}" || (echo "ERROR: CALF_STABLE_REPO is required for CALF promotion check." && exit 1)
+      if [ -n "${CALF_KUBI_URL:-}" ]; then
+        export KUBI_URL="${CALF_KUBI_URL}"
+      fi
+      if [ -n "${CALF_KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="${CALF_KUBI_TOKEN}"
+      elif [ -z "${KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="$(kubi token ${CALF_KUBI_TOKEN_ARGS:-${KUBI_TOKEN_ARGS:-}} --scopes="promote")"
+      fi
+  script:
+    - docker-promote check --repo "${CALF_STAGING_REPO}" --image "${CI_PROJECT_NAME}" --tag="${IMAGE_TAG}" --json
+
+image_promote_calf:
+  stage: promote
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools/promote:latest
+  needs: ["promote_check_calf"]
+  variables:
+    REPO: ${CALF_STAGING_REPO}
+    PROMOTED_REPO: ${CALF_STABLE_REPO}
+  rules:
+    - if: '$PIPELINE_KIND == "tag" && $PROMOTE_ENABLED == "true"'
+  before_script:
+    - !reference [.ci_preamble, before_script]
+    - |
+      set -euo pipefail
+      test -n "${CALF_STAGING_REPO:-}" || (echo "ERROR: CALF_STAGING_REPO is required for CALF promotion." && exit 1)
+      test -n "${CALF_STABLE_REPO:-}" || (echo "ERROR: CALF_STABLE_REPO is required for CALF promotion." && exit 1)
+      if [ -n "${CALF_KUBI_URL:-}" ]; then
+        export KUBI_URL="${CALF_KUBI_URL}"
+      fi
+      if [ -n "${CALF_KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="${CALF_KUBI_TOKEN}"
+      elif [ -z "${KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="$(kubi token ${CALF_KUBI_TOKEN_ARGS:-${KUBI_TOKEN_ARGS:-}} --scopes="promote")"
+      fi
+  script:
+    - docker-promote promote --source-repo "${CALF_STAGING_REPO}" --target-repo "${CALF_STABLE_REPO}" --image "${CI_PROJECT_NAME}" --tag="${IMAGE_TAG}" --json
+
+gitops_update:
+  stage: gitops_update
+  extends: .ci_preamble
+  image: cagip-sfs-docker-stable-intranet.$REGISTRY/ci-tools/gitops-git-yq
+  resource_group: gitops-repo-main
+  rules:
+    # GitOps DEV/STAGING uniquement. La PROD multi-entités a son job dédié : gitops_update_prod_all_entities.
+    - if: '$GITOPS_ENABLED == "true" && $PIPELINE_KIND != "tag"'
+  variables:
+    GITOPS_WORKDIR: "gitops-repo"
+    MAX_RETRIES: "8"
+    GITOPS_TARGET_BRANCH: "main"
+    GITOPS_FILE_RELATIVE_PATH: "platform-gitops/values/${TARGET_ENV}/backstage/${CI_PROJECT_NAME}.yaml"
+    YAML_IMAGE_REPO_PATH: ".image.repository"
+    YAML_IMAGE_TAG_PATH: ".image.tag"
+  script:
+    - set -euo pipefail
+    - |
+      git fetch origin "$GITOPS_TARGET_BRANCH"
+      git checkout "$GITOPS_TARGET_BRANCH"
+      git reset --hard "origin/$GITOPS_TARGET_BRANCH"
+      missing=0
+      for v in GITOPS_PROJECT_PATH GIT_PUSH_TOKEN TARGET_ENV IMAGE_REPOSITORY IMAGE_TAG; do
+        if [ -z "${!v:-}" ]; then
+          echo "ERROR: missing variable $v"
+          missing=1
+        fi
+      done
+      if [ "$missing" -eq 1 ]; then exit 1; fi
+    - git config --global user.email "ci-bot@local"
+    - git config --global user.name "ci-bot"
+    - export GITOPS_REPO_URL="https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH}.git"
+    - echo "Cloning GitOps repo:${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH} (branch=${GITOPS_TARGET_BRANCH})"
+    - rm -rf "${GITOPS_WORKDIR}"
+    - git clone --depth 50 --branch "${GITOPS_TARGET_BRANCH}" "${GITOPS_REPO_URL}" "${GITOPS_WORKDIR}"
+    - export TARGET_FILE="${GITOPS_WORKDIR}/${GITOPS_FILE_RELATIVE_PATH}"
+    - echo "Target values file:${TARGET_FILE}"
+    - |
+      if [ ! -f "${TARGET_FILE}" ]; then
+        echo "ERROR: values file not found: ${TARGET_FILE}"
+        echo "Tip: verify TARGET_ENV / CI_PROJECT_NAME / repo structure."
+        find "${GITOPS_WORKDIR}" -maxdepth 4 -type f | sed -n '1,80p'
+        exit 1
+      fi
+    - echo "Updating image repository=${IMAGE_REPOSITORY}/${CI_PROJECT_NAME} tag=${IMAGE_TAG}"
+    - yq -i "${YAML_IMAGE_REPO_PATH} = \"${IMAGE_REPOSITORY}/${CI_PROJECT_NAME}\"" "${TARGET_FILE}"
+    - yq -i "${YAML_IMAGE_TAG_PATH} = \"${IMAGE_TAG}\"" "${TARGET_FILE}"
+    - cd "${GITOPS_WORKDIR}"
+    - git status --porcelain
+    - git diff -- "${GITOPS_FILE_RELATIVE_PATH}" || true
+    - |
+      if git diff --quiet; then
+        echo "No change detected, nothing to commit."
+        exit 0
+      fi
+    - git add "${GITOPS_FILE_RELATIVE_PATH}"
+    - git commit -m "chore(gitops):update ${CI_PROJECT_NAME} - ${TARGET_ENV} - ${IMAGE_TAG} (${CI_PROJECT_PATH}@${CI_COMMIT_SHORT_SHA})"
+    - |
+      for i in $(seq 1 $MAX_RETRIES); do
+        git fetch origin "$GITOPS_TARGET_BRANCH"
+        git rebase "origin/$GITOPS_TARGET_BRANCH" || { git rebase --abort; continue; }
+        if git push origin "HEAD:$GITOPS_TARGET_BRANCH"; then
+          echo "Push OK"
+          exit 0
+        fi
+        echo "Push failed, retry $i/$MAX_RETRIES..."
+        sleep $((RANDOM % 5 + 1))
+      done
+      echo "ERROR: could not push after retries"
+      exit 1
+
+# =========================
+# PROD — GitOps multi-entités
+# =========================
+# Ce job est séparé du gitops_update DEV/STAGING car le path production dépend de l'entité.
+# Pour ajouter une entité :
+# 1. dupliquer image_push_calf / promote_check_calf / image_promote_calf ;
+# 2. ajouter le job image_promote_<entity> dans needs ;
+# 3. ajouter un bloc update_entity "<entity>" "${<ENTITY>_STABLE_REPO}" ci-dessous.
+gitops_update_prod_all_entities:
+  stage: gitops_update
+  extends: .ci_preamble
+  image: cagip-sfs-docker-stable-intranet.$REGISTRY/ci-tools/gitops-git-yq
+  resource_group: gitops-repo-main
+  needs:
+    - job: image_promote_calf
+  rules:
+    - if: '$PIPELINE_KIND == "tag" && $GITOPS_ENABLED == "true"'
+  variables:
+    GITOPS_WORKDIR: "gitops-repo"
+    MAX_RETRIES: "8"
+    GITOPS_TARGET_BRANCH: "main"
+    YAML_IMAGE_REPO_PATH: ".image.repository"
+    YAML_IMAGE_TAG_PATH: ".image.tag"
+  script:
+    - set -euo pipefail
+    - |
+      missing=0
+      for v in GITOPS_PROJECT_PATH GIT_PUSH_TOKEN TARGET_ENV IMAGE_TAG REGISTRY CALF_STABLE_REPO; do
+        if [ -z "${!v:-}" ]; then
+          echo "ERROR: missing variable $v"
+          missing=1
+        fi
+      done
+      if [ "$missing" -eq 1 ]; then exit 1; fi
+    - git config --global user.email "ci-bot@local"
+    - git config --global user.name "ci-bot"
+    - export GITOPS_REPO_URL="https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH}.git"
+    - echo "Cloning GitOps repo:${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH} (branch=${GITOPS_TARGET_BRANCH})"
+    - rm -rf "${GITOPS_WORKDIR}"
+    - git clone --depth 50 --branch "${GITOPS_TARGET_BRANCH}" "${GITOPS_REPO_URL}" "${GITOPS_WORKDIR}"
+    - |
+      update_entity() {
+        entity_code="$1"
+        stable_repo="$2"
+
+        target_file="${GITOPS_WORKDIR}/platform-gitops/values/production/${entity_code}/backstage/${CI_PROJECT_NAME}.yaml"
+        image_repository="${stable_repo}.${REGISTRY}/${CI_PROJECT_NAME}"
+
+        echo "Updating PROD GitOps for entity=${entity_code}"
+        echo "Target values file=${target_file}"
+        echo "Image repository=${image_repository}"
+        echo "Image tag=${IMAGE_TAG}"
+
+        if [ ! -f "${target_file}" ]; then
+          echo "ERROR: values file not found for entity ${entity_code}: ${target_file}"
+          echo "Tip: expected path is platform-gitops/values/production/${entity_code}/backstage/${CI_PROJECT_NAME}.yaml"
+          find "${GITOPS_WORKDIR}/platform-gitops/values/production" -maxdepth 4 -type f | sed -n '1,120p' || true
+          exit 1
+        fi
+
+        yq -i "${YAML_IMAGE_REPO_PATH} = \"${image_repository}\"" "${target_file}"
+        yq -i "${YAML_IMAGE_TAG_PATH} = \"${IMAGE_TAG}\"" "${target_file}"
+      }
+
+      # Entité actuellement activée.
+      update_entity "calf" "${CALF_STABLE_REPO}"
+
+      # Exemple d'ajout futur :
+      # update_entity "nouvelle-entite" "${NOUVELLE_ENTITE_STABLE_REPO}"
+    - cd "${GITOPS_WORKDIR}"
+    - git status --porcelain
+    - git diff -- "platform-gitops/values/production" || true
+    - |
+      if git diff --quiet; then
+        echo "No production GitOps change detected, nothing to commit."
+        exit 0
+      fi
+    - git add "platform-gitops/values/production"
+    - git commit -m "chore(gitops):update ${CI_PROJECT_NAME} - production entities - ${IMAGE_TAG} (${CI_PROJECT_PATH}@${CI_COMMIT_SHORT_SHA})"
+    - |
+      for i in $(seq 1 $MAX_RETRIES); do
+        git fetch origin "$GITOPS_TARGET_BRANCH"
+        git rebase "origin/$GITOPS_TARGET_BRANCH" || { git rebase --abort; continue; }
+        if git push origin "HEAD:$GITOPS_TARGET_BRANCH"; then
+          echo "Push OK"
+          exit 0
+        fi
+        echo "Push failed, retry $i/$MAX_RETRIES..."
+        sleep $((RANDOM % 5 + 1))
+      done
+      echo "ERROR: could not push after retries"
+      exit 1
+
+create_tag_on_main:
+  extends: .ci_preamble
+  stage: version_and_tag
+  image: cagip-sfs-docker-stable-intranet.$REGISTRY/ci-tools/gitops-git-yq
+  resource_group: versioning-main
+  script:
+    - |
+      if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+        echo "Missing GIT_PUSH_TOKEN (masked). Required to push Git tags."
+        exit 1
+      fi
+    - export GIT_REPO_URL="https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git config --global user.email "ci-bot@local"
+    - git config --global user.name "ci-bot"
+    - git remote set-url origin "$GIT_REPO_URL"
+    - git fetch --tags origin
+    - |
+      BUMP=major
+      if echo "${CI_COMMIT_MESSAGE}" | grep -q "Merge branch 'release/" >/dev/null; then
+        BUMP="minor"
+      elif echo "${CI_COMMIT_MESSAGE}" | grep -q "Merge branch 'hotfix/" >/dev/null; then
+        BUMP="patch"
+      else
+        echo "No release/* or hotfix/* detected in merge message => skipping tag."
+        exit 0
+      fi
+
+      LAST_TAG="$(git tag -l "v${VERSION_MAJOR}.*" --sort=-v:refname | head -n 1)"
+      echo "LAST_TAG=${LAST_TAG:-<none>}"
+
+      if [ -z "${LAST_TAG}" ]; then
+        NEW_TAG="v${VERSION_MAJOR}.0.0"
+      else
+        VER="${LAST_TAG#v}"
+        IFS='.' read -r CUR_MAJOR CUR_MINOR CUR_PATCH <<< "${VER}"
+
+        if [ "${BUMP}" = "minor" ]; then
+          NEW_MINOR=$((CUR_MINOR + 1))
+          NEW_PATCH=0
+        else
+          NEW_MINOR=${CUR_MINOR}
+          NEW_PATCH=$((CUR_PATCH + 1))
+        fi
+        NEW_TAG="v${VERSION_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
+      fi
+    - git tag -a "${NEW_TAG}" -m "$BUMP release:$NEW_TAG"
+    - git push origin "${NEW_TAG}"
+    - printf "TAG=%s" "$NEW_TAG" > tag.env
+  artifacts:
+    reports:
+      dotenv: tag.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - when: never
+
+create_backmerge_mr:
+  stage: backmerge
+  image: cagip-sfs-docker-stable-intranet.$REGISTRY/ci-tools/gitops-git-yq
+  needs:
+    - job: create_tag_on_main
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      if [ -z "${TAG:-}" ]; then
+        echo "No TAG produced => skip backmerge MR"
+        exit 0
+      fi
+      if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+        echo "Missing GIT_PUSH_TOKEN (masked). Required to create backmerge MR."
+        exit 1
+      fi
+
+      SOURCE_BRANCH="main"
+      TARGET_BRANCH="develop"
+      TITLE="Backmerge ${SOURCE_BRANCH} -> ${TARGET_BRANCH} (${TAG})"
+      DESC="Automated backmerge MR created after tag ${TAG}.\n\n- Source: ${SOURCE_BRANCH}\n- Target: ${TARGET_BRANCH}\n- Tag: ${TAG}\n"
+
+      curl --fail -sS --request POST \
+        --header "PRIVATE-TOKEN: ${GIT_PUSH_TOKEN}" \
+        --form "source_branch=${SOURCE_BRANCH}" \
+        --form "target_branch=${TARGET_BRANCH}" \
+        --form "title=${TITLE}" \
+        --form "description=${DESC}" \
+        --form "remove_source_branch=false" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests"
