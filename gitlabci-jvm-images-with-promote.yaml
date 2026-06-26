@@ -1,0 +1,521 @@
+stages:
+  - validate
+  - test
+  - build
+  - image
+  - promote_check
+  - promote
+  - gitops_update
+  - version_and_tag
+  - backmerge
+
+workflow:
+  name: '$PROJECT_PIPELINE_NAME'
+  rules:
+    # =========================
+    # PROD — tag immuable
+    # =========================
+    - if: $CI_COMMIT_TAG
+      variables:
+        PIPELINE_KIND: "tag"
+        TARGET_ENV: "production"
+        GITOPS_ENABLED: "true"
+        # En production, l'image JVM est d'abord construite/poussée dans le repo staging,
+        # puis promue vers le repo stable avant le GitOps update.
+        REPO: ${STAGING_REPO}
+        PROMOTE_ENABLED: "true"
+        PROMOTED_REPO: ${STABLE_REPO}
+        PROJECT_PIPELINE_NAME: 'Nouveau tag - Promotion image JVM de PRODUCTION'
+
+    # =========================
+    # MAIN / MASTER — merges
+    # =========================
+
+
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|master)$/'
+      variables:
+        PIPELINE_KIND: "main"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'Main: Création de nouveau tag pour déploiement en production'
+
+    # =========================
+    # RELEASE / HOTFIX
+    # =========================
+    - if: '$CI_COMMIT_BRANCH =~ /^release\\/.*$/'
+      variables:
+        PIPELINE_KIND: "release"
+        TARGET_ENV: "staging"
+        REPO: ${STAGING_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Release: Build de STAGING'
+
+    - if: '$CI_COMMIT_BRANCH =~ /^hotfix\\/.*$/'
+      variables:
+        PIPELINE_KIND: "hotfix"
+        TARGET_ENV: "staging"
+        REPO: ${STAGING_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Hotfix: Build de STAGING'
+
+
+    # =========================
+    # DEVELOP
+    # =========================
+    - if: '$SCHEDULE_KIND != "nightly" && $CI_COMMIT_BRANCH == "develop"'
+      variables:
+        PIPELINE_KIND: "develop"
+        TARGET_ENV: "development"
+        REPO: ${SCRATCH_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Develop : Déploiement en DEV'
+
+    # =========================
+    # FEATURE / MR
+    # =========================
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        PIPELINE_KIND: "mr"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'MERGE REQUEST : Validation CI'
+
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\\/.*$/'
+      variables:
+        PIPELINE_KIND: "feature"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+        PROJECT_PIPELINE_NAME: 'Feature branch : Valdidation CI'
+        #PIPELINE_KIND: "develop"
+        #TARGET_ENV: "development"
+        #REPO: ${SCRATCH_REPO}
+        #GITOPS_ENABLED: "true"
+        #PROJECT_PIPELINE_NAME: ' Develop : Déploiement Feature branch  en DEV'
+
+    # =========================
+    # NIGHTLY
+    # =========================
+    - if: '$SCHEDULE_KIND == "nightly" && $CI_COMMIT_BRANCH == "develop"'
+      variables:
+        PIPELINE_KIND: "nightly"
+        TARGET_ENV: "development"
+        REPO: ${SCRATCH_REPO}
+        GITOPS_ENABLED: "true"
+        PROJECT_PIPELINE_NAME: 'Nightly Develop : Déploiement quotidien en DEV'
+
+    # =========================
+    # FALLBACK
+    # =========================
+    - when: always
+      variables:
+        PIPELINE_KIND: "other"
+        TARGET_ENV: "none"
+        GITOPS_ENABLED: "false"
+
+variables:
+  # -Dmaven.repo.local : cache Maven local repo dans le workspace (pour le cache GitLab)
+  # -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn : moins de bruit dans les logs
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+  VERSION_MAJOR_FILE: "version.major"
+  REPO: "no_image_build"
+  PROMOTE_ENABLED: "false"
+  PROMOTED_REPO: ""
+  ENABLE_FEATURE_IMAGE_BUILD: "false"
+  # Désactive Git clean automatique entre les jobs → conserve target/ et .m2/ pour les jobs suivants
+  GIT_CLEAN_FLAGS: "-ffdx -e .m2/repository -e target/"
+
+# Cache global partagé par tous les jobs.
+# - key par branche : chaque branche a son propre cache mais hérite via fallback_keys
+# - fallback_keys : si pas de cache pour la branche courante, réutilise celui de develop puis main
+# - paths : dépendances Maven + caches Quarkus (générés au build, lourds à reconstruire)
+cache:
+  key:
+    files:
+      - pom.xml
+    prefix: "${CI_COMMIT_REF_SLUG}"
+  fallback_keys:
+    - "develop"
+    - "main"
+  paths:
+    - .m2/repository/
+    - target/quarkus/
+  policy: pull-push
+
+.ci_preamble:
+  before_script:
+    - |
+      if [ "${PIPELINE_KIND}" == "nightly" ]; then
+        IMAGE_TAG="d-${CI_COMMIT_SHORT_SHA}-nightly"
+      elif [ -n "${CI_COMMIT_TAG:-}" ]; then
+        IMAGE_TAG="${CI_COMMIT_TAG}"
+      else
+        if [ "${TARGET_ENV}" == "development" ]; then
+          IMAGE_TAG="d-${CI_COMMIT_SHORT_SHA}"
+        elif [ "${TARGET_ENV}" == "staging" ]; then
+            IMAGE_TAG="rc-${CI_COMMIT_SHORT_SHA}"
+        else 
+            IMAGE_TAG="NO_IMAGE_BUILT"
+        fi 
+      fi
+      export IMAGE_TAG
+    - export VERSION_MAJOR_FILE="${VERSION_MAJOR_FILE:-version.major}"
+    - test -f "${VERSION_MAJOR_FILE}" || (echo "Missing ${VERSION_MAJOR_FILE}. Create it with MAJOR integer" && exit 1)
+    - export VERSION_MAJOR="$(tr -d ' \n\r\t' < "${VERSION_MAJOR_FILE}")"
+    - export IMAGE_REPOSITORY="${REPO}.${REGISTRY}"
+    - export IMAGE_FULL="$IMAGE_REPOSITORY/${CI_PROJECT_NAME}:${IMAGE_TAG}"
+    - |
+      if [ -n "${PROMOTED_REPO:-}" ]; then
+        PROMOTED_IMAGE_REPOSITORY="${PROMOTED_REPO}.${REGISTRY}"
+        PROMOTED_IMAGE_FULL="$PROMOTED_IMAGE_REPOSITORY/${CI_PROJECT_NAME}:${IMAGE_TAG}"
+      else
+        PROMOTED_IMAGE_REPOSITORY=""
+        PROMOTED_IMAGE_FULL=""
+      fi
+      export PROMOTED_IMAGE_REPOSITORY PROMOTED_IMAGE_FULL
+    - |
+      echo "VERSION_MAJOR=${VERSION_MAJOR}"
+      echo "PIPELINE_KIND=${PIPELINE_KIND}"
+      echo "SCHEDULE_KIND=${SCHEDULE_KIND}"
+      echo "TARGET_ENV=${TARGET_ENV}"
+      echo "REPO=${REPO}"
+      echo "PIPELINE_KIND=$PIPELINE_KIND"
+      echo "TARGET_ENV=$TARGET_ENV"
+      echo "GITOPS_ENABLED=$GITOPS_ENABLED"
+      echo "IMAGE_TAG=$IMAGE_TAG"
+      echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY"
+      echo "IMAGE_FULL=$IMAGE_FULL"
+      echo "PROMOTE_ENABLED=${PROMOTE_ENABLED:-false}"
+      echo "PROMOTED_REPO=${PROMOTED_REPO:-}"
+      echo "PROMOTED_IMAGE_REPOSITORY=${PROMOTED_IMAGE_REPOSITORY:-}"
+      echo "PROMOTED_IMAGE_FULL=${PROMOTED_IMAGE_FULL:-}"
+
+
+lint_and_format:
+  extends: .ci_preamble
+  stage: validate
+  image: layer-kraft.$REGISTRY/eclipse-temurin:21-jdk-alpine
+  script:
+    - ./mvnw -s $MAVEN_SETTINGS_XML -q -DskipTests=true  -Djavax.net.ssl.trustStore=${TRUSTSTORE_PATH} -Djavax.net.ssl.trustStorePassword=${TRUSTSTORE_PASSWORD} verify
+  rules:
+    - if: '$PIPELINE_KIND == "mr"'
+    - if: '$PIPELINE_KIND == "feature"'
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+unit_tests:
+  extends: .ci_preamble
+  stage: test
+  image: layer-kraft.$REGISTRY/eclipse-temurin:21-jdk-alpine
+  script:
+    - ./mvnw -s $MAVEN_SETTINGS_XML -q  -Djavax.net.ssl.trustStore=${TRUSTSTORE_PATH} -Djavax.net.ssl.trustStorePassword=${TRUSTSTORE_PASSWORD} test
+  rules:
+    - if: '$PIPELINE_KIND == "mr"'
+    - if: '$PIPELINE_KIND == "feature"'
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+
+build_jvm:
+  extends: .ci_preamble
+  stage: build
+  image: layer-kraft.$REGISTRY/eclipse-temurin:21-jdk-alpine
+  script:
+    - ./mvnw -s $MAVEN_SETTINGS_XML -q -DskipTests=true   -Djavax.net.ssl.trustStore=${TRUSTSTORE_PATH} -Djavax.net.ssl.trustStorePassword=${TRUSTSTORE_PASSWORD}  versions:set -DnewVersion=${IMAGE_TAG}
+    - ./mvnw -s $MAVEN_SETTINGS_XML -q -DskipTests=true  -Djavax.net.ssl.trustStore=${TRUSTSTORE_PATH} -Djavax.net.ssl.trustStorePassword=${TRUSTSTORE_PASSWORD}  package
+  artifacts:
+    expire_in: 1 days
+    paths:
+      - target/quarkus-app/
+  rules:
+    - if: '$PIPELINE_KIND == "mr"'
+    - if: '$PIPELINE_KIND == "feature"'
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "tag"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+build_native:
+  extends: .ci_preamble
+  stage: build
+  image:
+    name:  cagip-sfs-docker-stable-intranet.registry.saas.cagip.group.gca/ci-tools/quarkus-mandrel-maven:mvn3.9.12-jdk-21
+    pull_policy: always
+    entrypoint:
+      - ""
+  script:
+    - ls  -la
+    - mvn -s $MAVEN_SETTINGS_XML  -DskipTests=true  versions:set -DnewVersion=${IMAGE_TAG}
+    - mvn -s $MAVEN_SETTINGS_XML  -DskipTests=true  package -Dnative -Dquarkus.native.container-build=false
+  artifacts:
+    expire_in: 7 days
+    paths:
+      - target/*-runner
+  rules:
+    # Validation uniquement : on compile le code en natif,
+    # mais on ne construit/pousse plus d'image Docker native.
+    - if: '$PIPELINE_KIND == "mr"'
+    - if: '$PIPELINE_KIND == "feature"'
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "tag"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+image_jvm_push:
+  stage: image
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools:latest
+  needs: ["build_jvm"]
+  variables:
+    DOCKERFILE: "src/main/docker/Dockerfile.jvm"
+  script:
+    - docker image build --tag ${IMAGE_FULL} --file ${DOCKERFILE} --build-arg build_tag=${IMAGE_TAG} --build-arg TRUSTSTORE_PASSWORD=${TRUSTSTORE_PASSWORD} ${CI_PROJECT_DIR}
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login --username ${CI_REGISTRY_USER} --password-stdin ${IMAGE_REPOSITORY}
+    - docker push ${IMAGE_FULL}
+  rules:
+    - if: '$PIPELINE_KIND == "develop"'
+    - if: '$PIPELINE_KIND == "release"'
+    - if: '$PIPELINE_KIND == "hotfix"'
+    - if: '$PIPELINE_KIND == "tag"'
+    - if: '$PIPELINE_KIND == "nightly"'
+
+image_native_push:
+  stage: image
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools:latest
+  needs: ["build_native"]
+  variables:
+    DOCKERFILE: "src/main/docker/Dockerfile.native-micro"
+  script:
+    - echo "Image native désactivée temporairement : le build natif reste exécuté pour validation, mais aucune image native n'est construite ni poussée."
+  rules:
+    - when: never
+
+
+promote_check:
+  stage: promote_check
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools/promote:latest
+  needs: ["image_jvm_push"]
+  rules:
+    - if: '$PIPELINE_KIND == "tag" && $PROMOTE_ENABLED == "true"'
+  before_script:
+    - !reference [.ci_preamble, before_script]
+    - |
+      set -euo pipefail
+      if [ -z "${PROMOTED_REPO:-}" ]; then
+        echo "ERROR: PROMOTED_REPO is required for image promotion."
+        exit 1
+      fi
+      if [ -z "${KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="$(kubi token ${KUBI_TOKEN_ARGS:-} --scopes="promote")"
+      fi
+  script:
+    - docker-promote check --repo "${REPO}" --image "${CI_PROJECT_NAME}" --tag="${IMAGE_TAG}" --json
+
+image_promote:
+  stage: promote
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools/promote:latest
+  needs: ["promote_check"]
+  rules:
+    - if: '$PIPELINE_KIND == "tag" && $PROMOTE_ENABLED == "true"'
+  before_script:
+    - !reference [.ci_preamble, before_script]
+    - |
+      set -euo pipefail
+      if [ -z "${PROMOTED_REPO:-}" ]; then
+        echo "ERROR: PROMOTED_REPO is required for image promotion."
+        exit 1
+      fi
+      if [ -z "${KUBI_TOKEN:-}" ]; then
+        export KUBI_TOKEN="$(kubi token ${KUBI_TOKEN_ARGS:-} --scopes="promote")"
+      fi
+  script:
+    - docker-promote promote --source-repo "${REPO}" --target-repo "${PROMOTED_REPO}" --image "${CI_PROJECT_NAME}" --tag="${IMAGE_TAG}" --json
+
+
+gitops_update:
+  stage: gitops_update
+  extends: .ci_preamble
+  image: layer-kraft.$REGISTRY/ci-tools/base
+  resource_group: gitops-repo-main
+  rules:
+    - if: '$GITOPS_ENABLED == "true"'
+  variables:
+    GITOPS_WORKDIR: "gitops-repo"
+    MAX_RETRIES: "8"
+    GITOPS_TARGET_BRANCH: "main"
+    GITOPS_FILE_RELATIVE_PATH: "platform-gitops/values/${TARGET_ENV}/ms/${CI_PROJECT_NAME}.yaml"
+    YAML_IMAGE_REPO_PATH: ".image.repository"
+    YAML_IMAGE_TAG_PATH: ".image.tag"
+  script:
+    - set -euo pipefail
+    - |
+      git fetch origin "$GITOPS_TARGET_BRANCH"
+      git checkout "$GITOPS_TARGET_BRANCH"
+      git reset --hard "origin/$GITOPS_TARGET_BRANCH"
+    - |
+      if [ "${PIPELINE_KIND}" = "tag" ]; then
+        if [ -z "${PROMOTED_IMAGE_REPOSITORY:-}" ]; then
+          echo "ERROR: PROMOTED_IMAGE_REPOSITORY is required for production GitOps update after promotion."
+          exit 1
+        fi
+        export IMAGE_REPOSITORY="${PROMOTED_IMAGE_REPOSITORY}"
+        export IMAGE_FULL="${PROMOTED_IMAGE_FULL}"
+      fi
+
+      missing=0
+      for v in GITOPS_PROJECT_PATH GIT_PUSH_TOKEN TARGET_ENV IMAGE_REPOSITORY IMAGE_TAG; do
+        if [ -z "${!v:-}" ]; then
+          echo "ERROR: missing variable $v"
+          missing=1
+        fi
+      done
+      if [ "$missing" -eq 1 ]; then exit 1; fi
+    - git config --global user.email "ci-bot@local"
+    - git config --global user.name "ci-bot"
+    - export GITOPS_REPO_URL="https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH}.git"
+    - echo "Cloning GitOps repo:${CI_SERVER_HOST}/${GITOPS_PROJECT_PATH} (branch=${GITOPS_TARGET_BRANCH})"
+    - rm -rf "${GITOPS_WORKDIR}"
+    - git clone --depth 50 --branch "${GITOPS_TARGET_BRANCH}" "${GITOPS_REPO_URL}" "${GITOPS_WORKDIR}"
+    # --- Compute & check target file ---
+    - export TARGET_FILE="${GITOPS_WORKDIR}/${GITOPS_FILE_RELATIVE_PATH}"
+    - echo "Target values file:${TARGET_FILE}"
+    - |
+      if [ ! -f "${TARGET_FILE}" ]; then
+        echo "ERROR: values file not found: ${TARGET_FILE}"
+        echo "Tip: verify TARGET_ENV / CI_PROJECT_NAME / repo structure."
+        find "${GITOPS_WORKDIR}" -maxdepth 4 -type f | sed -n '1,80p'
+        exit 1
+      fi
+
+    # --- Update YAML with yq ---
+    - echo "Updating image repository=${IMAGE_REPOSITORY}/${CI_PROJECT_NAME} tag=${IMAGE_TAG}"
+    - yq -i "${YAML_IMAGE_REPO_PATH} = \"${IMAGE_REPOSITORY}/${CI_PROJECT_NAME}\"" "${TARGET_FILE}"
+    - yq -i "${YAML_IMAGE_TAG_PATH} = \"${IMAGE_TAG}\"" "${TARGET_FILE}"
+
+    # --- Show diff, commit, push ---
+    - cd "${GITOPS_WORKDIR}"
+    - git status --porcelain
+    - git diff -- "${GITOPS_FILE_RELATIVE_PATH}" || true
+    - |
+      if git diff --quiet; then
+      echo "No change detected, nothing to commit."
+      exit 0
+      fi
+    - git add "${GITOPS_FILE_RELATIVE_PATH}"
+    - git commit -m "chore(gitops):update ${CI_PROJECT_NAME} - ${TARGET_ENV} - ${IMAGE_TAG} (${CI_PROJECT_PATH}@${CI_COMMIT_SHORT_SHA})"
+    - |
+      for i in $(seq 1 $MAX_RETRIES); do
+        git fetch origin "$GITOPS_TARGET_BRANCH"
+        git rebase "origin/$GITOPS_TARGET_BRANCH" || { git rebase --abort; continue; }
+      
+        if git push origin "HEAD:$GITOPS_TARGET_BRANCH"; then
+          echo "Push OK"
+          exit 0
+        fi
+        echo "Push failed, retry $i/$MAX_RETRIES..."
+        sleep $((RANDOM % 5 + 1))
+      done
+      echo "ERROR: could not push after retries"
+      exit 1
+
+create_tag_on_main:
+  extends: .ci_preamble
+  stage: version_and_tag
+  image: layer-kraft.$REGISTRY/ci-tools/base
+  resource_group: versioning-main
+  script:
+    - |
+      if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+        echo "Missing GIT_PUSH_TOKEN (masked). Required to push Git tags."
+        exit 1
+      fi
+    - export GIT_REPO_URL="https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git config --global user.email "ci-bot@local"
+    - git config --global user.name "ci-bot"
+    - git remote set-url origin "$GIT_REPO_URL"
+    - git fetch --tags origin
+    - |
+      BUMP=major
+      if echo "${CI_COMMIT_MESSAGE}" | grep "Merge branch 'release/" >/dev/null; then
+        BUMP="minor"
+      elif echo "${CI_COMMIT_MESSAGE}" | grep "Merge branch 'hotfix/" >/dev/null; then
+        BUMP="patch"
+      else
+        echo "No release/* or hotfix/* detected in merge message => skipping tag."
+        exit 0
+      fi
+
+      LAST_TAG="$(git tag -l "v${VERSION_MAJOR}.*" --sort=-v:refname | head -n 1)"
+      echo "LAST_TAG=${LAST_TAG:-<none>}"
+      
+      if [ -z "${LAST_TAG}" ]; then
+        NEW_TAG="v${VERSION_MAJOR}.0.0"
+      else
+        VER="${LAST_TAG#v}"
+        IFS='.' read -r CUR_MAJOR CUR_MINOR CUR_PATCH <<< "${VER}"
+      
+        if [ "${BUMP}" = "minor" ]; then
+          NEW_MINOR=$((CUR_MINOR + 1))
+          NEW_PATCH=0
+        else
+          NEW_MINOR=${CUR_MINOR}
+          NEW_PATCH=$((CUR_PATCH + 1))
+        fi
+        NEW_TAG="v${VERSION_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
+      fi
+    - git tag -a "${NEW_TAG}" -m "$BUMP release:$NEW_TAG"
+    - git push origin "${NEW_TAG}"
+    - printf "TAG=%s" "$NEW_TAG" > tag.env
+  artifacts:
+    reports:
+      dotenv: tag.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - when: never
+
+
+create_backmerge_mr:
+  stage: backmerge
+  image: layer-kraft.$REGISTRY/ci-tools/base
+  needs:
+    - job: create_tag_on_main
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      if [ -z "${TAG:-}" ]; then
+        echo "No TAG produced => skip backmerge MR"
+        exit 0
+      fi
+      if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+        echo "Missing GIT_PUSH_TOKEN (masked). Required to create backmerge MR."
+        exit 1
+      fi
+      
+      # Variables
+      SOURCE_BRANCH="main"
+      TARGET_BRANCH="develop"
+      TITLE="Backmerge ${SOURCE_BRANCH} -> ${TARGET_BRANCH} (${TAG})"
+      DESC="Automated backmerge MR created after tag ${TAG}.\n\n- Source: ${SOURCE_BRANCH}\n- Target: ${TARGET_BRANCH}\n- Tag: ${TAG}\n"
+
+      # Create MR (use a PAT or Project Access Token with api scope)
+      curl --fail -sS --request POST \
+      --header "PRIVATE-TOKEN: ${GIT_PUSH_TOKEN}" \
+      --form "source_branch=${SOURCE_BRANCH}" \
+      --form "target_branch=${TARGET_BRANCH}" \
+      --form "title=${TITLE}" \
+      --form "description=${DESC}" \
+      --form "remove_source_branch=false" \
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests"
