@@ -1,0 +1,336 @@
+stages:
+  - render
+  - deploy
+
+variables:
+  VALUES_ROOT: "platform-gitops/values"
+  MANIFESTS_OUT_DIR: "manifests"
+
+  DEFAULT_CHART_MS: "charts/quarkus-ms"
+  DEFAULT_CHART_BACKSTAGE: "charts/backstage"
+  DEFAULT_CHART_BATCH: "charts/quarkus-batch"
+
+  CI_SKIP_PUSH_OPTION: "-o ci.skip"
+
+  # Environnements autorisés à être synchronisés automatiquement dans ArgoCD.
+  # IMPORTANT :
+  # - On garde uniquement "development" par défaut.
+  # - La production est volontairement exclue : les manifests PROD sont générés,
+  #   mais la synchro ArgoCD PROD reste manuelle côté entité.
+  ARGO_SYNC_ALLOWED_ENVS: "development"
+
+  PRODUCTION_ENV: "production"
+  ARGO_SYNC_DISABLED_APPS: "none"
+
+  # Entités PROD supportées.
+  # Pour ajouter une entité, ajouter son code ici, par exemple :
+  # PROD_ENTITIES: "calf entity2 entity3"
+  PROD_ENTITIES: "calf"
+
+  # Namespace ArgoCD par défaut pour les environnements non-prod gérés par CAGIP.
+  DEFAULT_ARGO_NAMESPACE: "sfs-sandbox-development"
+
+render_manifests:
+  stage: render
+  resource_group: gitops-manifests
+  image: layer-kraft.registry.saas.cagip.group.gca/ci-tools/helm:3
+  before_script:
+    - set -euo pipefail
+    - git config user.email "ci-bot@local"
+    - git config user.name "ci-bot"
+    - |
+      if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+        echo "ERROR: GIT_PUSH_TOKEN is required to push rendered manifests."
+        exit 1
+      fi
+    - git remote set-url origin "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch --all --tags --prune
+    - git checkout -B "${CI_COMMIT_BRANCH}" "origin/${CI_COMMIT_BRANCH}"
+  script:
+    - |
+      set -euo pipefail
+
+      echo "CI_COMMIT_SHA=${CI_COMMIT_SHA}"
+      echo "CI_COMMIT_BEFORE_SHA=${CI_COMMIT_BEFORE_SHA}"
+      echo "VALUES_ROOT=${VALUES_ROOT}"
+      echo "MANIFESTS_OUT_DIR=${MANIFESTS_OUT_DIR}"
+      echo "PROD_ENTITIES=${PROD_ENTITIES}"
+
+      # ============================================================
+      # 1) Détecter les values modifiés
+      # ============================================================
+      #
+      # Structures attendues :
+      #
+      # Non-prod CAGIP :
+      #   platform-gitops/values/development/<kind>/<app>.yaml
+      #   platform-gitops/values/staging/<kind>/<app>.yaml
+      #
+      # Prod par entité :
+      #   platform-gitops/values/production/<entity>/<kind>/<app>.yaml
+      #
+      # Exemple :
+      #   platform-gitops/values/production/calf/ms/referential-ms.yaml
+      #
+      if [ "${CI_COMMIT_BEFORE_SHA:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${CI_COMMIT_BEFORE_SHA:-}" ]; then
+        echo "No before SHA => fallback: scan all values"
+        CHANGED_VALUES="$(find "${VALUES_ROOT}" -type f -name "*.y*ml" | sort || true)"
+      else
+        CHANGED_VALUES="$(git diff --name-only "${CI_COMMIT_BEFORE_SHA}" "${CI_COMMIT_SHA}" \
+          | grep -E "^${VALUES_ROOT}/(development|staging)/[^/]+/[^/]+\.(ya?ml)$|^${VALUES_ROOT}/production/[^/]+/[^/]+/[^/]+\.(ya?ml)$" \
+          || true)"
+      fi
+
+      if [ -z "${CHANGED_VALUES}" ]; then
+        echo "No values changes detected => nothing to render"
+        echo "DEPLOY_APPS=" > deploy.env
+        exit 0
+      fi
+
+      echo "Changed values:"
+      echo "${CHANGED_VALUES}"
+
+      rm -f deploy.env apps-to-sync.txt || true
+      touch apps-to-sync.txt
+
+      # ============================================================
+      # 2) Render uniquement les apps touchées
+      # ============================================================
+      for f in ${CHANGED_VALUES}; do
+        REL="${f#${VALUES_ROOT}/}"
+        IFS='/' read -r ENV PART2 PART3 PART4 EXTRA <<< "${REL}"
+
+        ENTITY=""
+        KIND=""
+        APP_FILE=""
+
+        if [ "${ENV}" = "${PRODUCTION_ENV}" ]; then
+          # Structure PROD :
+          #   values/production/<entity>/<kind>/<app>.yaml
+          ENTITY="${PART2}"
+          KIND="${PART3}"
+          APP_FILE="${PART4}"
+
+          if [ -z "${ENTITY}" ] || [ -z "${KIND}" ] || [ -z "${APP_FILE}" ] || [ -n "${EXTRA:-}" ]; then
+            echo "ERROR: invalid production values path: ${f}"
+            echo "Expected: ${VALUES_ROOT}/production/<entity>/<kind>/<app>.yaml"
+            exit 1
+          fi
+
+          if ! echo " ${PROD_ENTITIES} " | grep -q " ${ENTITY} "; then
+            echo "ERROR: unsupported production entity '${ENTITY}' in file ${f}"
+            echo "Allowed entities: ${PROD_ENTITIES}"
+            exit 1
+          fi
+        else
+          # Structure non-prod :
+          #   values/<env>/<kind>/<app>.yaml
+          KIND="${PART2}"
+          APP_FILE="${PART3}"
+
+          if [ -z "${KIND}" ] || [ -z "${APP_FILE}" ] || [ -n "${PART4:-}" ]; then
+            echo "ERROR: invalid non-production values path: ${f}"
+            echo "Expected: ${VALUES_ROOT}/<development|staging>/<kind>/<app>.yaml"
+            exit 1
+          fi
+        fi
+
+        APP="${APP_FILE%.*}"
+
+        # Chart par défaut selon KIND.
+        if [ "${KIND}" = "backstage" ]; then
+          CHART_PATH="${DEFAULT_CHART_BACKSTAGE}"
+        elif [ "${KIND}" = "batch" ]; then
+          CHART_PATH="${DEFAULT_CHART_BATCH}"
+        elif [ "${KIND}" = "ms" ]; then
+          CHART_PATH="${DEFAULT_CHART_MS}"
+        else
+          echo "ERROR: unsupported kind '${KIND}' in file ${f}"
+          echo "Allowed kinds: ms, backstage, batch"
+          exit 1
+        fi
+
+        if [ "${ENV}" = "${PRODUCTION_ENV}" ]; then
+          RELEASE_NAME="${APP}"
+          ARGO_APP="${APP}-${ENTITY}-${ENV}"
+          OUT="${MANIFESTS_OUT_DIR}/${ENV}/${ENTITY}/${APP}/manifest.yaml"
+        else
+          RELEASE_NAME="${APP}"
+          ARGO_APP="${APP}-${ENV}"
+          OUT="${MANIFESTS_OUT_DIR}/${ENV}/${APP}/manifest.yaml"
+        fi
+
+        echo "----"
+        echo "ENV=${ENV}"
+        echo "ENTITY=${ENTITY:-none}"
+        echo "KIND=${KIND}"
+        echo "APP=${APP}"
+        echo "VALUES=${f}"
+        echo "CHART=${CHART_PATH}"
+        echo "RELEASE=${RELEASE_NAME}"
+        echo "ARGO_APP=${ARGO_APP}"
+        echo "OUT=${OUT}"
+
+        mkdir -p "$(dirname "${OUT}")"
+
+        if [ -f "${CHART_PATH}/Chart.yaml" ]; then
+          helm dependency build "${CHART_PATH}" || true
+        fi
+
+        helm template "${RELEASE_NAME}" "${CHART_PATH}" \
+          -f "${f}" \
+          > "${OUT}"
+
+        echo "${ARGO_APP}" >> apps-to-sync.txt
+      done
+
+      # ============================================================
+      # 3) Commit uniquement si les manifests changent
+      # ============================================================
+      git add "${MANIFESTS_OUT_DIR}/" || true
+
+      if git diff --cached --quiet; then
+        echo "No manifest diff => no commit"
+      else
+        git commit -m "chore(gitops): render manifests (${CI_COMMIT_SHORT_SHA})"
+        git push origin "${CI_COMMIT_BRANCH}" ${CI_SKIP_PUSH_OPTION}
+      fi
+
+      # ============================================================
+      # 4) Exporter la liste des apps candidates à sync
+      # ============================================================
+      #
+      # Les apps PROD peuvent apparaître ici, mais deploy_argocd les filtrera
+      # car ARGO_SYNC_ALLOWED_ENVS ne contient pas "production".
+      #
+      APPS_CSV="$(sort -u apps-to-sync.txt | paste -sd, -)"
+      echo "DEPLOY_APPS=${APPS_CSV}" > deploy.env
+      echo "Apps to sync candidates: ${APPS_CSV}"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 day
+
+deploy_argocd:
+  stage: deploy
+  image: layer-kraft.registry.saas.cagip.group.gca/ci-tools/helm:3
+  needs: ["render_manifests"]
+  rules:
+    - when: on_success
+  variables:
+    NS: "${DEFAULT_ARGO_NAMESPACE}"
+  script:
+    - |
+      set -euo pipefail
+
+      filter_sync_app() {
+        local local_app="$1"
+        local local_env="$2"
+
+        # La production est toujours exclue de la synchro automatique.
+        # Les manifests PROD sont seulement générés et commités.
+        # La sync ArgoCD PROD doit rester manuelle par l'entité.
+        if [ "${local_env}" = "${PRODUCTION_ENV}" ]; then
+          return 1
+        fi
+
+        if ! echo " ${ARGO_SYNC_ALLOWED_ENVS} " | grep -q " ${local_env} " ; then
+          return 1
+        fi
+
+        if [ -n "${ARGO_SYNC_DISABLED_APPS}" ] && [ "${ARGO_SYNC_DISABLED_APPS}" != "none" ]; then
+          echo " ${ARGO_SYNC_DISABLED_APPS} " | grep -q " ${local_app} " && return 1
+        fi
+
+        return 0
+      }
+
+      parse_deploy_app() {
+        local app_ref="$1"
+
+        # Formats produits par render_manifests :
+        #   non-prod : <app>-<env>
+        #   prod     : <app>-<entity>-production
+        #
+        # Comme les noms d'app peuvent contenir des tirets, on parse par suffixe.
+        ENTITY=""
+        ENVIRONMENT=""
+
+        if echo "${app_ref}" | grep -q -- "-${PRODUCTION_ENV}$"; then
+          ENVIRONMENT="${PRODUCTION_ENV}"
+          local without_env="${app_ref%-${PRODUCTION_ENV}}"
+          ENTITY="${without_env##*-}"
+          APPLICATION="${without_env%-${ENTITY}}"
+        else
+          ENVIRONMENT="${app_ref##*-}"
+          APPLICATION="${app_ref%-${ENVIRONMENT}}"
+        fi
+
+        export APPLICATION ENTITY ENVIRONMENT
+      }
+
+      if [ -z "${DEPLOY_APPS:-}" ]; then
+        echo "No apps to deploy"
+        exit 0
+      fi
+
+      echo "Sync candidates: ${DEPLOY_APPS}"
+      echo "ARGO_SYNC_ALLOWED_ENVS=${ARGO_SYNC_ALLOWED_ENVS}"
+      echo "PRODUCTION_ENV=${PRODUCTION_ENV}"
+      echo "Reminder: production auto sync is disabled by design."
+
+      FILTERED_DEPLOY=""
+      SYNCED_APP=""
+
+      while read -r app; do
+        [ -z "${app}" ] && continue
+
+        parse_deploy_app "${app}"
+
+        if [ "${ENVIRONMENT}" = "${PRODUCTION_ENV}" ]; then
+          ARGO_APP_NAME="${APPLICATION}-${ENTITY}-${ENVIRONMENT}"
+          ARGO_PATH="${MANIFESTS_OUT_DIR}/${ENVIRONMENT}/${ENTITY}/${APPLICATION}"
+        else
+          ARGO_APP_NAME="${APPLICATION}-${ENVIRONMENT}"
+          ARGO_PATH="${MANIFESTS_OUT_DIR}/${ENVIRONMENT}/${APPLICATION}"
+        fi
+
+        if filter_sync_app "${APPLICATION}" "${ENVIRONMENT}"; then
+          echo "---- Sync ${ARGO_APP_NAME} ----"
+
+          if [ -z "${ARGOCD_HOST:-}" ] || [ -z "${ARGOCD_TOKEN:-}" ] || [ -z "${K8S_CLUSTER_URL:-}" ]; then
+            echo "ERROR: ARGOCD_HOST, ARGOCD_TOKEN and K8S_CLUSTER_URL are required for automatic ArgoCD sync."
+            exit 1
+          fi
+
+          argocd app create "${ARGO_APP_NAME}" \
+                            --server "${ARGOCD_HOST}" \
+                            --project "${NS}" \
+                            --repo "https://${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+                            --revision "${CI_COMMIT_REF_NAME}" \
+                            --path "${ARGO_PATH}" \
+                            --dest-namespace "${NS}" \
+                            --dest-server "${K8S_CLUSTER_URL}" \
+                            --auth-token "${ARGOCD_TOKEN}" \
+                            --upsert
+
+          argocd app sync "${ARGO_APP_NAME}" \
+                            --server "${ARGOCD_HOST}" \
+                            --auth-token "${ARGOCD_TOKEN}" \
+                            --prune
+
+          argocd app wait "${ARGO_APP_NAME}" \
+                            --server "${ARGOCD_HOST}" \
+                            --auth-token "${ARGOCD_TOKEN}" \
+                            --timeout 120
+
+          SYNCED_APP="${SYNCED_APP}${ARGO_APP_NAME},"
+        else
+          echo "---- Skip auto sync ${ARGO_APP_NAME} ----"
+          echo "Reason: env '${ENVIRONMENT}' is not allowed for automatic sync or app is disabled."
+          FILTERED_DEPLOY="${FILTERED_DEPLOY}${ARGO_APP_NAME},"
+        fi
+      done <<< "$(echo "${DEPLOY_APPS}" | tr ',' '\n')"
+
+      echo "SYNCED APPS = ${SYNCED_APP}"
+      echo "FILTERED APPS = ${FILTERED_DEPLOY}"
